@@ -1012,6 +1012,7 @@ fn analytics_hook_source(source: HookSource) -> &'static str {
         HookSource::SessionFlags => "session_flags",
         HookSource::Plugin => "plugin",
         HookSource::CloudRequirements => "cloud_requirements",
+        HookSource::CloudManagedConfig => "cloud_managed_config",
         HookSource::LegacyManagedConfigFile => "legacy_managed_config_file",
         HookSource::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
         HookSource::Unknown => "unknown",
@@ -1069,12 +1070,9 @@ pub(crate) fn subagent_source_name(subagent_source: &SubAgentSource) -> String {
 }
 
 pub(crate) fn subagent_parent_thread_id(subagent_source: &SubAgentSource) -> Option<String> {
-    match subagent_source {
-        SubAgentSource::ThreadSpawn {
-            parent_thread_id, ..
-        } => Some(parent_thread_id.to_string()),
-        _ => None,
-    }
+    subagent_source
+        .parent_thread_id()
+        .map(|parent_thread_id| parent_thread_id.to_string())
 }
 
 fn analytics_hook_status(status: HookRunStatus) -> HookRunStatus {
