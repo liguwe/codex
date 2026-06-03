@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Stage and optionally package the @openai/codex npm module."""
+"""Stage and optionally package Codex npm release artifacts.
+
+这个脚本不是 Codex CLI 的运行入口，而是发布入口：它把 monorepo 里的
+源码、package.json 和预编译 native binary 组装进一个临时 staging 目录，
+必要时再调用 `npm pack` 产出可发布的 tgz 包。
+"""
 
 import argparse
 import json
@@ -18,8 +23,16 @@ CODEX_SDK_ROOT = REPO_ROOT / "sdk" / "typescript"
 CODEX_NPM_NAME = "@openai/codex"
 CODEX_PACKAGE_COMPONENT = "codex-package"
 
-# `npm_name` is the local optional-dependency alias consumed by `bin/codex.js`.
-# The underlying package published to npm is always `@openai/codex`.
+# Codex 的 npm 发布模型有两层：
+#
+# 1. `@openai/codex` meta package：
+#    只包含 `bin/codex.js`，用户安装和执行的统一入口。
+# 2. platform package：
+#    每个平台/架构一份，里面放 Rust 编译出来的 native binary。
+#
+# `npm_name` 是 meta package 里 optionalDependencies 使用的别名，也就是
+# `bin/codex.js` 运行时会尝试解析的包名。真正发布到 npm registry 的底层包名
+# 仍然是 `@openai/codex`，只是通过不同 prerelease 版本区分平台产物。
 CODEX_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
     "codex-linux-x64": {
         "npm_name": "@openai/codex-linux-x64",
@@ -65,10 +78,17 @@ CODEX_PLATFORM_PACKAGES: dict[str, dict[str, str]] = {
     },
 }
 
+# 一次 staging `codex` release 时，实际需要同时准备 meta package 和所有平台包。
 PACKAGE_EXPANSIONS: dict[str, list[str]] = {
     "codex": ["codex", *CODEX_PLATFORM_PACKAGES],
 }
 
+# 每种 npm 包需要从 vendor tree 中拷贝哪些 native component。
+#
+# - `codex` meta package 不带 native binary，只声明 optionalDependencies。
+# - `codex-<platform>` 平台包拷贝整个 codex-package component。
+# - `codex-responses-api-proxy` 只拷贝 proxy 对应的 native component。
+# - `codex-sdk` 是 TypeScript SDK，需要本地 build 生成 dist。
 PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex": [],
     "codex-linux-x64": [CODEX_PACKAGE_COMPONENT],
@@ -81,6 +101,7 @@ PACKAGE_NATIVE_COMPONENTS: dict[str, list[str]] = {
     "codex-sdk": [],
 }
 
+# 平台包只应该包含自己的 target triple，不能把其他平台的 binary 一起打进去。
 PACKAGE_TARGET_FILTERS: dict[str, str] = {
     package_name: package_config["target_triple"]
     for package_name, package_config in CODEX_PLATFORM_PACKAGES.items()
@@ -139,6 +160,9 @@ def main() -> int:
     package = args.package
     version = args.version
     release_version = args.release_version
+
+    # `--release-version` 是 release staging 的语义化参数；如果同时传了
+    # `--version`，两者必须一致，避免 staging 包和发布版本发生漂移。
     if release_version:
         if version and version != release_version:
             raise RuntimeError("--version and --release-version must match when both are provided.")
@@ -150,12 +174,15 @@ def main() -> int:
     staging_dir, created_temp = prepare_staging_dir(args.staging_dir)
 
     try:
+        # 第一步只组装 JS/README/package.json 等普通 npm 包内容。
         stage_sources(staging_dir, version, package)
 
         vendor_src = args.vendor_src.resolve() if args.vendor_src else None
         native_components = PACKAGE_NATIVE_COMPONENTS.get(package, [])
         target_filter = PACKAGE_TARGET_FILTERS.get(package)
 
+        # 第二步按需把预编译 native binary 从 vendor-src 拷贝进 staging。
+        # native 产物通常由更外层的 release/stage 脚本提前下载或构建好。
         if native_components:
             if vendor_src is None:
                 components_str = ", ".join(native_components)
@@ -174,6 +201,7 @@ def main() -> int:
 
         if release_version:
             staging_dir_str = str(staging_dir)
+            # release 模式只 staging，不自动验证；这里打印的是人工 smoke test 命令。
             if package == "codex":
                 print(
                     f"Staged version {version} for release in {staging_dir_str}\n\n"
@@ -215,6 +243,11 @@ def main() -> int:
 
 
 def prepare_staging_dir(staging_dir: Path | None) -> tuple[Path, bool]:
+    """Create or validate the staging directory.
+
+    staging 目录就是即将被 `npm pack` 的包根目录。外部指定目录时要求为空，
+    防止旧产物混进新包；未指定时创建临时目录，并故意保留给后续检查。
+    """
     if staging_dir is not None:
         staging_dir = staging_dir.resolve()
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -227,10 +260,12 @@ def prepare_staging_dir(staging_dir: Path | None) -> tuple[Path, bool]:
 
 
 def stage_sources(staging_dir: Path, version: str, package: str) -> None:
+    """Copy package sources into staging and write the final package.json."""
     package_json: dict
     package_json_path: Path | None = None
 
     if package == "codex":
+        # meta package：只带 Node wrapper，不带 native binary。
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CODEX_CLI_ROOT / "bin" / "codex.js", bin_dir / "codex.js")
@@ -241,6 +276,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
 
         package_json_path = CODEX_CLI_ROOT / "package.json"
     elif package in CODEX_PLATFORM_PACKAGES:
+        # platform package：只带 vendor native payload，并通过 os/cpu 限制安装平台。
         platform_package = CODEX_PLATFORM_PACKAGES[package]
         platform_npm_tag = platform_package["npm_tag"]
         platform_version = compute_platform_package_version(version, platform_npm_tag)
@@ -270,6 +306,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         if isinstance(package_manager, str):
             package_json["packageManager"] = package_manager
     elif package == "codex-responses-api-proxy":
+        # responses API proxy 有自己的 npm launcher 和 package.json。
         bin_dir = staging_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
         launcher_src = RESPONSES_API_PROXY_NPM_ROOT / "bin" / "codex-responses-api-proxy.js"
@@ -281,6 +318,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
 
         package_json_path = RESPONSES_API_PROXY_NPM_ROOT / "package.json"
     elif package == "codex-sdk":
+        # SDK 发布前需要先跑 TypeScript 构建，把 dist 拷贝进 staging。
         package_json_path = CODEX_SDK_ROOT / "package.json"
         stage_codex_sdk_sources(staging_dir)
     else:
@@ -292,6 +330,8 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         package_json["version"] = version
 
     if package == "codex":
+        # meta package 通过 optionalDependencies 拉取平台 native 包。
+        # npm 会根据平台包自己的 os/cpu 字段只安装匹配当前机器的那一份。
         package_json["files"] = ["bin/codex.js"]
         package_json["optionalDependencies"] = {
             CODEX_PLATFORM_PACKAGES[platform_package]["npm_name"]: (
@@ -303,6 +343,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         }
 
     elif package == "codex-sdk":
+        # 发布包里不需要 prepare 脚本，避免用户安装 SDK 时再次触发本地构建。
         scripts = package_json.get("scripts")
         if isinstance(scripts, dict):
             scripts.pop("prepare", None)
@@ -330,6 +371,7 @@ def run_command(cmd: list[str], cwd: Path | None = None) -> None:
 
 
 def stage_codex_sdk_sources(staging_dir: Path) -> None:
+    """Build the TypeScript SDK and copy its publishable files."""
     package_root = CODEX_SDK_ROOT
 
     run_command(["pnpm", "install", "--frozen-lockfile"], cwd=package_root)
@@ -356,6 +398,18 @@ def copy_native_binaries(
     components: list[str],
     target_filter: set[str] | None = None,
 ) -> None:
+    """Copy requested native components from a hydrated vendor tree.
+
+    `vendor_src` 的形状大致是：
+
+        vendor/
+          <target-triple>/
+            codex-package/
+            codex-responses-api-proxy/
+
+    当 component 是 `codex-package` 时，整个平台 target 目录都会被拷贝；
+    其他 component 则只拷贝目标 component 子目录。
+    """
     vendor_src = vendor_src.resolve()
     if not vendor_src.exists():
         raise RuntimeError(f"Vendor source directory not found: {vendor_src}")
@@ -382,6 +436,7 @@ def copy_native_binaries(
 
         dest_target_dir = vendor_dest / target_dir.name
 
+        # codex platform package 需要保留 target 目录下的完整 native payload。
         if CODEX_PACKAGE_COMPONENT in components_set:
             if dest_target_dir.exists():
                 shutil.rmtree(dest_target_dir)
@@ -389,6 +444,7 @@ def copy_native_binaries(
         else:
             dest_target_dir.mkdir(parents=True, exist_ok=True)
 
+        # 非 codex-package 的 component 只按名称精确拷贝。
         for component in sorted(components_set - {CODEX_PACKAGE_COMPONENT}):
             src_component_dir = target_dir / component
             if not src_component_dir.exists():
@@ -402,17 +458,21 @@ def copy_native_binaries(
             shutil.copytree(src_component_dir, dest_component_dir)
 
     if target_filter is not None:
+        # 平台包必须命中自己的 target，否则会发布出缺 binary 的 npm 包。
         missing_targets = sorted(target_filter - copied_targets)
         if missing_targets:
             missing_list = ", ".join(missing_targets)
             raise RuntimeError(f"Missing target directories in vendor source: {missing_list}")
 
+
 def run_npm_pack(staging_dir: Path, output_path: Path) -> Path:
+    """Run `npm pack` against the staged package and move the tarball to output_path."""
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="codex-npm-pack-") as pack_dir_str:
         pack_dir = Path(pack_dir_str)
+        # 使用独立 npm cache/log 目录，避免 release packaging 被用户本机 npm 状态污染。
         npm_cache_dir = pack_dir / "npm-cache"
         npm_logs_dir = pack_dir / "npm-logs"
         npm_cache_dir.mkdir()
